@@ -5,13 +5,15 @@ export default function LEDDotEditor() {
     const cols = 32;
     const cellSize = 20; // px
 
+    const fullBufferRef = useRef("");
+
     const [dots, setDots] = useState<number[][]>(Array.from({ length: rows }, () => Array(cols).fill(0)));
 
     // 내보내기 옵션 (LED 128바이트용)
-    const [swapPairs, setSwapPairs] = useState(true); // [1,0,3,2,5,4,7,6]
-    const [reverseNibble, setReverseNibble] = useState(false);
-    const [invertBits, setInvertBits] = useState(false);
-    const [singleLine, setSingleLine] = useState(true); // 한 줄 출력 옵션 (기본 ON)
+    const [swapPairs] = useState(true); // [1,0,3,2,5,4,7,6]
+    const [reverseNibble] = useState(false);
+    const [invertBits] = useState(false);
+    const [singleLine] = useState(true); // 한 줄 출력 옵션 (기본 ON)
     const [fileName, setFileName] = useState(""); // 한 줄 출력 옵션 (기본 ON)
 
     // .fnt / 레거시 헥사 입력
@@ -125,6 +127,42 @@ export default function LEDDotEditor() {
         }
         return out; // length = 128
     };
+    function bytes128ToDotsFromNibbles(bytes: number[]): number[][] {
+        const rows = 16;
+        const cols = 32;
+        const dots: number[][] = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+        // 안전하게 앞 128바이트만 사용
+        const buf = bytes.slice(0, 128);
+        while (buf.length < 128) buf.push(0);
+
+        for (let y = 0; y < rows; y++) {
+            for (let n = 0; n < 8; n++) {
+                const nib = buf[y * 8 + n] & 0x0f; // 하위 4비트만 사용
+                for (let k = 0; k < 4; k++) {
+                    const bit = (nib >> k) & 1;
+                    const x = n * 4 + k; // buildFrameBytes 와 동일
+                    dots[y][x] = bit;
+                }
+            }
+        }
+
+        return dots;
+    }
+    function undoSwapPairs(bytes: number[]): number[] {
+        const output: number[] = [];
+        const restoreOrder = [1, 0, 3, 2, 5, 4, 7, 6]; // 쌍교환 역순 (사실 자기자신이 역함수)
+
+        for (let y = 0; y < 16; y++) {
+            const row = bytes.slice(y * 8, y * 8 + 8);
+            const restored: number[] = new Array(8);
+            for (let i = 0; i < 8; i++) {
+                restored[restoreOrder[i]] = row[i];
+            }
+            output.push(...restored);
+        }
+        return output;
+    }
 
     // LED_Display용 HEX 128바이트로 패킹 (C 배열 형태로 복사)
     const exportHexForLED = () => {
@@ -254,6 +292,8 @@ export default function LEDDotEditor() {
 
             // textarea에는 정규화된 .fnt 라인을 보여주도록
             const normalizedFnt = exportFntFromDots(newDots);
+            console.log(normalizedFnt);
+
             //setFntInput(normalizedFnt);
 
             alert("헥사를 해석해서 LED 도트 변환했습니다.");
@@ -324,43 +364,103 @@ export default function LEDDotEditor() {
 
     // ===== UART 수신 로직 =====
 
+    // const handleLineFromMcu = (line: string) => {
+    //     const trimmed = line.trim();
+    //     console.log(trimmed);
+
+    //     if (!trimmed) return;
+
+    //     if (!uartEnabled) {
+    //         setRxLog(prev => [trimmed, ...prev].slice(0, 50));
+    //         return;
+    //     }
+
+    //     try {
+    //         const bytes = legacyFntLineToBytes(trimmed);
+    //         const newDots = bytesToDots32x16(bytes);
+    //         setDots(newDots);
+    //         setFntInput(trimmed);
+    //         setRxLog(prev => [trimmed, ...prev].slice(0, 50));
+    //     } catch (e) {
+    //         console.error("MCU 라인 파싱 실패:", e, line);
+    //         console.log(rxLog);
+    //     }
+    // };
     const handleLineFromMcu = (line: string) => {
         const trimmed = line.trim();
-        console.log(trimmed);
-
+        console.log("RX:", trimmed);
         if (!trimmed) return;
 
-        if (!uartEnabled) {
-            setRxLog(prev => [trimmed, ...prev].slice(0, 50));
-            return;
+        // 1) C 배열 스타일 (0x??) 이면 그걸로 파싱
+        let bytes = parseCArrayHex(trimmed);
+        if (!bytes) {
+            // 2) 아니면 레거시 텍스트 헥사 ("0 F A 3C ..." 같은거)
+            bytes = legacyFntLineToBytes(trimmed);
         }
 
-        try {
-            const bytes = legacyFntLineToBytes(trimmed);
-            const newDots = bytesToDots32x16(bytes);
-            setDots(newDots);
-            setFntInput(trimmed);
-            setRxLog(prev => [trimmed, ...prev].slice(0, 50));
-        } catch (e) {
-            console.error("MCU 라인 파싱 실패:", e, line);
+        console.log("parsed bytes len =", bytes.length);
+
+        let newDots: number[][];
+
+        if (bytes.length >= 128) {
+            // 🔹 MCU에서 LED_Data_embedded[128] 덤프한 경우 (nibble 패킹)
+            const raw128 = bytes.slice(0, 128);
+            const unswapped = undoSwapPairs(raw128);
+            newDots = bytes128ToDotsFromNibbles(unswapped);
+        } else {
+            // 🔹 옛날 .fnt 포맷 (16행 × 4바이트 = 64바이트) 같은 경우
+            newDots = bytesToDots32x16(bytes);
         }
+
+        setDots(newDots);
+        setFntInput(trimmed);
     };
+
+    function parseCArrayHex(line: string) {
+        const matches = line.match(/0x[0-9A-Fa-f]{2}/g);
+        if (!matches) return null;
+        return matches.map(h => parseInt(h.slice(2), 16));
+    }
 
     const startSerialReadLoop = async (port: any) => {
         if (!port.readable) return;
+
         const reader = port.readable.getReader();
         readerRef.current = reader;
 
-        const decoder = new TextDecoder();
+        const decoder = new TextDecoder("utf-8");
         let buffer = "";
 
         try {
             while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
+                let value: Uint8Array | undefined;
+                let done: boolean = false;
+
+                try {
+                    const result = await reader.read();
+                    value = result.value;
+                    done = result.done;
+                } catch (e: any) {
+                    // ★ 여기서 BreakError 무시
+                    const msg = String(e?.message ?? e);
+                    if (msg.includes("Break")) {
+                        console.warn("UART BREAK 수신 - 프레임 끊김, 무시하고 계속 읽기");
+                        continue; // while(true) 다시
+                    }
+
+                    console.error("시리얼 읽기 오류(치명적):", e);
+                    break; // 루프 종료
+                }
+
+                if (done) {
+                    console.log("reader.read() done=true, 루프 종료");
+                    break;
+                }
                 if (!value) continue;
 
                 const chunk = decoder.decode(value, { stream: true });
+                // 디버깅용
+                // console.log("chunk:", JSON.stringify(chunk));
                 buffer += chunk;
 
                 let idx: number;
@@ -368,11 +468,10 @@ export default function LEDDotEditor() {
                 while ((idx = buffer.indexOf("\n")) >= 0) {
                     const line = buffer.slice(0, idx);
                     buffer = buffer.slice(idx + 1);
+                    // console.log("라인:", JSON.stringify(line));
                     handleLineFromMcu(line);
                 }
             }
-        } catch (e) {
-            console.error("시리얼 읽기 오류:", e);
         } finally {
             try {
                 reader.releaseLock();
@@ -391,6 +490,8 @@ export default function LEDDotEditor() {
 
             const port = await (navigator as any).serial.requestPort();
 
+            console.log(port);
+
             // 포트 정보 → 표시용 문자열로
             const info = port.getInfo();
             let label = "";
@@ -403,7 +504,7 @@ export default function LEDDotEditor() {
             }
             setPortInfo(label);
 
-            await port.open({ baudRate: 115200 });
+            await port.open({ baudRate: 9600 });
 
             setSerialPort(port);
             setSerialStatus("연결됨");

@@ -4,5 +4,5 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
     plugins: [react()],
-    base: "/led-matrix-editor/", // ★ 이거 추가
+    base: "/led-editor/", // ★ 이거 추가
 });
