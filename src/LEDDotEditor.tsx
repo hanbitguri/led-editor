@@ -12,14 +12,25 @@ export default function LEDDotEditor() {
     const [reverseNibble, setReverseNibble] = useState(false);
     const [invertBits, setInvertBits] = useState(false);
     const [singleLine, setSingleLine] = useState(true); // 한 줄 출력 옵션 (기본 ON)
+    const [fileName, setFileName] = useState(""); // 한 줄 출력 옵션 (기본 ON)
 
     // .fnt / 레거시 헥사 입력
     const [fntInput, setFntInput] = useState("");
+
+    const [testHex, setTestHex] = useState("0 0 0 0 0 1 801 801 ...");
 
     // 드래그 상태
     const [isDragging, setIsDragging] = useState(false);
     const dragValueRef = useRef<0 | 1>(1); // 드래그 중에 칠할 값(1=켜기, 0=끄기)
     const gridRef = useRef<HTMLDivElement | null>(null);
+
+    // ===== UART 관련 상태 =====
+    const [uartEnabled, setUartEnabled] = useState(false); // 통신모드 체크박스
+    const [serialPort, setSerialPort] = useState<any>(null);
+    const readerRef = useRef<any>(null);
+    const [serialStatus, setSerialStatus] = useState("미연결");
+    const [rxLog, setRxLog] = useState<string[]>([]);
+    const [portInfo, setPortInfo] = useState<string>(""); // 표시용 포트 이름
 
     // 마우스 올라가면 드래그 종료
     useEffect(() => {
@@ -113,15 +124,6 @@ export default function LEDDotEditor() {
             for (const idx of pairOrder) out.push(nibbles[idx]);
         }
         return out; // length = 128
-    };
-
-    // 현재 dots(16x32)를 0/1 바이너리 배열 문자열로 내보내기
-    const exportBinaryMatrix = () => {
-        const lines = dots.map(row => "  [" + row.join(", ") + "]");
-        const text = "[\n" + lines.join(",\n") + "\n];";
-
-        navigator.clipboard.writeText(text);
-        alert("현재 도트를 0/1 바이너리 배열로 클립보드에 복사했습니다!");
     };
 
     // LED_Display용 HEX 128바이트로 패킹 (C 배열 형태로 복사)
@@ -254,10 +256,10 @@ export default function LEDDotEditor() {
             const normalizedFnt = exportFntFromDots(newDots);
             //setFntInput(normalizedFnt);
 
-            alert("레거시 헥사를 해석해서 LED 도트 + .fnt 포맷으로 변환했습니다.");
+            alert("헥사를 해석해서 LED 도트 변환했습니다.");
         } catch (e: any) {
             console.error(e);
-            alert(e?.message ?? "레거시 헥사 파싱 중 오류가 발생했습니다.");
+            alert(e?.message ?? "헥사 파싱 중 오류가 발생했습니다.");
         }
     };
 
@@ -275,7 +277,7 @@ export default function LEDDotEditor() {
 
         const a = document.createElement("a");
         a.href = url;
-        a.download = "font.fnt"; // 원하는 파일명
+        a.download = `${fileName}.fnt`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -320,6 +322,120 @@ export default function LEDDotEditor() {
         setDots(Array.from({ length: rows }, () => Array(cols).fill(0)));
     };
 
+    // ===== UART 수신 로직 =====
+
+    const handleLineFromMcu = (line: string) => {
+        const trimmed = line.trim();
+        console.log(trimmed);
+
+        if (!trimmed) return;
+
+        if (!uartEnabled) {
+            setRxLog(prev => [trimmed, ...prev].slice(0, 50));
+            return;
+        }
+
+        try {
+            const bytes = legacyFntLineToBytes(trimmed);
+            const newDots = bytesToDots32x16(bytes);
+            setDots(newDots);
+            setFntInput(trimmed);
+            setRxLog(prev => [trimmed, ...prev].slice(0, 50));
+        } catch (e) {
+            console.error("MCU 라인 파싱 실패:", e, line);
+        }
+    };
+
+    const startSerialReadLoop = async (port: any) => {
+        if (!port.readable) return;
+        const reader = port.readable.getReader();
+        readerRef.current = reader;
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (!value) continue;
+
+                const chunk = decoder.decode(value, { stream: true });
+                buffer += chunk;
+
+                let idx: number;
+                // eslint-disable-next-line no-cond-assign
+                while ((idx = buffer.indexOf("\n")) >= 0) {
+                    const line = buffer.slice(0, idx);
+                    buffer = buffer.slice(idx + 1);
+                    handleLineFromMcu(line);
+                }
+            }
+        } catch (e) {
+            console.error("시리얼 읽기 오류:", e);
+        } finally {
+            try {
+                reader.releaseLock();
+            } catch {}
+            readerRef.current = null;
+            setSerialStatus("연결 해제됨");
+        }
+    };
+
+    const connectSerial = async () => {
+        try {
+            if (!(navigator as any).serial) {
+                alert("이 브라우저는 Web Serial API를 지원하지 않습니다. (Chrome/Edge 권장)");
+                return;
+            }
+
+            const port = await (navigator as any).serial.requestPort();
+
+            // 포트 정보 → 표시용 문자열로
+            const info = port.getInfo();
+            let label = "";
+            if (info.usbVendorId || info.usbProductId) {
+                const vid = info.usbVendorId ? info.usbVendorId.toString(16).padStart(4, "0") : "????";
+                const pid = info.usbProductId ? info.usbProductId.toString(16).padStart(4, "0") : "????";
+                label = `USB ${vid}:${pid}`;
+            } else {
+                label = "Serial Device";
+            }
+            setPortInfo(label);
+
+            await port.open({ baudRate: 115200 });
+
+            setSerialPort(port);
+            setSerialStatus("연결됨");
+            alert(`포트 연결됨\n포트이름: ${label}`);
+
+            startSerialReadLoop(port);
+        } catch (e: any) {
+            console.error(e);
+            alert("시리얼 연결 실패: " + e?.message);
+        }
+    };
+
+    const disconnectSerial = async () => {
+        try {
+            if (readerRef.current) {
+                try {
+                    await readerRef.current.cancel();
+                } catch {}
+                readerRef.current = null;
+            }
+            if (serialPort) {
+                await serialPort.close();
+                setSerialPort(null);
+            }
+            setSerialStatus("미연결");
+            setPortInfo("");
+            alert("포트 연결이 해제되었습니다.");
+        } catch (e) {
+            console.error("시리얼 해제 오류:", e);
+        }
+    };
+
     return (
         <div
             style={{
@@ -332,26 +448,94 @@ export default function LEDDotEditor() {
                 color: "#e5e7eb",
                 background: "#111827",
                 minHeight: "100vh",
+                width: "100%",
             }}
         >
-            <h1 style={{ fontSize: 18, fontWeight: 500 }}>32×16 LED 도트 에디터 (한국제어 제작)</h1>
+            <h1 style={{ fontSize: 18, fontWeight: 500 }}>32×16 LED 매트릭스 에디터 (한국제어 제작)</h1>
 
             <div
                 style={{
                     display: "flex",
-                    gap: 16,
+                    gap: 12,
                     flexWrap: "wrap",
                     alignItems: "center",
                 }}
             >
-                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>
+                        [마우스 좌클릭 드래그] : <span style={{ color: "#df7a28" }}>그리기</span> | [마우스 우클릭 드래그] :{" "}
+                        <span style={{ color: "#3b568a" }}>지우기</span>
+                    </div>
+                </div>
+                <div
+                    style={{
+                        display: "flex",
+                        gap: 8,
+                        alignItems: "center",
+                        fontSize: 12,
+                    }}
+                >
+                    <span>
+                        상태: <b>{serialStatus}</b>
+                        {serialPort && portInfo && <span style={{ marginLeft: 8 }}>{/* 연결 포트이름: <b>{portInfo}</b> */}</span>}
+                    </span>
+                    {!serialPort ? (
+                        <button onClick={connectSerial} style={btnStyle("#16a34a")}>
+                            포트 연결
+                        </button>
+                    ) : (
+                        <button onClick={disconnectSerial} style={btnStyle("#b91c1c")}>
+                            연결 해제
+                        </button>
+                    )}
+                </div>
+
+                {/* <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
                     <input type="checkbox" checked={swapPairs} onChange={e => setSwapPairs(e.target.checked)} />쌍 교환 [1,0,3,2,5,4,7,6]
                 </label>
-
-                <span style={{ fontSize: 12, opacity: 0.8 }}>팁: 마우스 좌클릭 드래그=그리기, 우클릭 드래그=지우기, 터치 드래그 지원</span>
                 <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                    <input type="checkbox" checked={singleLine} onChange={e => setSingleLine(e.target.checked)} />한 줄로 출력
+                    <input type="checkbox" checked={singleLine} onChange={e => setSingleLine(e.target.checked)} />한 줄로 출력(HEX
+                    128바이트)
+                </label> */}
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <input type="checkbox" checked={uartEnabled} onChange={e => setUartEnabled(e.target.checked)} />
+                    UART 통신모드
                 </label>
+                <input
+                    value={testHex}
+                    onChange={e => setTestHex(e.target.value)}
+                    style={{
+                        width: 300,
+                        padding: 4,
+                        borderRadius: 6,
+                        border: "1px solid #4b5563",
+                        background: "#020617",
+                        color: "#e5e7eb",
+                        fontFamily: "monospace",
+                        fontSize: 11,
+                    }}
+                    placeholder="테스트용 HEX 한 줄"
+                />
+                <button
+                    onClick={() => handleLineFromMcu(testHex)}
+                    style={{
+                        padding: "8px",
+                        borderRadius: 8,
+                        border: "none",
+                        color: "white",
+                        height: "20px",
+                        background: "#374151",
+                        cursor: "pointer",
+                        fontWeight: 400,
+                        display: "flex",
+                        alignItems: "center",
+                        fontSize: "10px",
+                    }}
+                >
+                    테스트 수신
+                </button>
             </div>
 
             {/* X 축 번호 */}
@@ -430,18 +614,22 @@ export default function LEDDotEditor() {
                     )}
                 </div>
             </div>
+            <div
+                style={{
+                    width: "70%",
+                    maxWidth: 720,
+                    display: "flex",
+                }}
+            ></div>
 
             {/* 버튼 */}
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button onClick={exportHexForLED} style={btnStyle("#10B981")}>
-                    복사하기 (HEX 128바이트)
+                    복사 (HEX 128바이트 - 임베디드 폰트용)
                 </button>
-                <button onClick={exportBinaryMatrix} style={btnStyle("#4a5d83")}>
-                    복사하기 (바이너리)
-                </button>
-                <button onClick={downloadFntFile} style={btnStyle("#1f519c")}>
-                    .fnt 파일로 저장
-                </button>
+                {/* <button onClick={exportBinaryMatrix} style={btnStyle("#4a5d83")}>
+                    복사 (바이너리)
+                </button> */}
 
                 <button onClick={clearAll} style={btnStyle("#6b7280")}>
                     전체 지우기
@@ -453,33 +641,85 @@ export default function LEDDotEditor() {
                 style={{
                     display: "flex",
                     flexDirection: "column",
+                    alignItems: "center",
                     gap: 8,
                     marginTop: 12,
                     width: 680,
                     maxWidth: "100%",
                 }}
             >
-                <textarea
-                    value={fntInput}
-                    onChange={e => setFntInput(e.target.value)}
-                    rows={3}
-                    style={{
-                        width: "100%",
-                        resize: "vertical",
-                        padding: 8,
-                        borderRadius: 6,
-                        border: "1px solid #4b5563",
-                        background: "#020617",
-                        color: "#e5e7eb",
-                        fontFamily: "monospace",
-                        fontSize: 12,
-                    }}
-                    placeholder="0 0 0 0 FE7FE01FFE7FF03F801 1860801 ..."
-                />
-                <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={handleImportLegacyFnt} style={btnStyle("#6366F1")}>
-                        헥사값 DISPLAY
-                    </button>
+                <div style={{ display: "flex", flexDirection: "row", gap: 8, alignContent: "center", width: "100%" }}>
+                    <textarea
+                        value={fntInput}
+                        onChange={e => setFntInput(e.target.value)}
+                        rows={3}
+                        style={{
+                            width: "80%",
+                            resize: "vertical",
+                            padding: 8,
+                            borderRadius: 6,
+                            border: "1px solid #4b5563",
+                            background: "#020617",
+                            color: "#e5e7eb",
+                            fontFamily: "monospace",
+                            fontSize: 12,
+                        }}
+                        placeholder="HEX INPUT: LEGACY 헥사값을 여기에 붙여넣으세요."
+                    />
+                    <div>
+                        <button
+                            onClick={handleImportLegacyFnt}
+                            style={{
+                                padding: "8px 12px",
+                                borderRadius: 8,
+                                border: "none",
+                                color: "white",
+                                fontSize: "8px",
+                                width: "100%",
+                                marginBottom: 8,
+                                background: "#df7a28",
+                                cursor: "pointer",
+                                fontWeight: 500,
+                            }}
+                        >
+                            HEX DISPLAY
+                        </button>
+                        <div style={{ display: "flex" }}>
+                            <input
+                                value={fileName}
+                                onChange={e => setFileName(e.target.value)}
+                                style={{
+                                    width: "30%",
+                                    height: "20px",
+                                    resize: "none",
+                                    padding: 8,
+                                    borderRadius: 6,
+                                    border: "1px solid #4b5563",
+                                    background: "#020617",
+                                    color: "#e5e7eb",
+                                    fontFamily: "monospace",
+                                    marginRight: 8,
+                                    fontSize: 12,
+                                }}
+                                placeholder="파일명"
+                            />
+                            <button
+                                onClick={downloadFntFile}
+                                style={{
+                                    padding: "8px 12px",
+                                    borderRadius: 8,
+                                    border: "none",
+                                    color: "white",
+                                    fontSize: "8px",
+                                    background: "#152688",
+                                    cursor: "pointer",
+                                    fontWeight: 500,
+                                }}
+                            >
+                                현재 도트를 .fnt 파일로 저장
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
