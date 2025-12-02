@@ -262,10 +262,10 @@ export default function LEDDotEditor() {
     };
 
     const downloadFntFile = () => {
-        // dots -> 레거시와 동일한 64바이트를 헥사 텍스트로 변환
+        // 레거시 디코더 역함수로 만든 128글자 라인
         const line = exportLegacyStyleFromDots(dots);
 
-        // 레거시 파일들은 CRLF(0x0D 0x0A)로 끝남
+        // 레거리 로더는 128바이트를 읽고, 우리는 그 뒤에 CRLF(\r\n)을 달아 저장
         const fntContent = line + "\r\n";
 
         const blob = new Blob([fntContent], {
@@ -275,14 +275,13 @@ export default function LEDDotEditor() {
 
         const a = document.createElement("a");
         a.href = url;
-        a.download = "font.fnt";
+        a.download = "font.fnt"; // 원하는 파일명
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
 
         URL.revokeObjectURL(url);
     };
-
     function exportLegacyStyleFromDots(dots: number[][]): string {
         // 1) dots -> 레거시가 쓰는 64바이트(16행 × 4바이트, little-endian)
         const bytes: number[] = [];
@@ -294,25 +293,27 @@ export default function LEDDotEditor() {
                     v |= 1 << x; // bytesToDots32x16 의 역연산
                 }
             }
-            // little-endian으로 4바이트 쪼개기 (레거시 .fnt 와 동일)
+            // little-endian 4바이트
             bytes.push(v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff);
         }
 
-        // 2) 64바이트 -> 레거시 스타일 토큰
+        // 2) 64바이트 -> 레거시 스타일 128글자
         //    규칙:
-        //      - 0x00 -> "0"
-        //      - 그 외는 앞 0 없이 대문자 헥사 ("1", "8", "80", "C0" 등)
-        const tokens: string[] = [];
-        for (const b of bytes) {
-            if (b === 0) {
-                tokens.push("0");
-            } else {
-                tokens.push(b.toString(16).toUpperCase()); // "1" ~ "FF"
-            }
-        }
+        //      - 0x00       -> "0 "
+        //      - 0x01~0x0F  -> "1 " ~ "F "
+        //      - 0x10~0xFF  -> "10" ~ "FF"
+        const hexChars = "0123456789ABCDEF";
 
-        // 3) 공백으로 구분된 한 줄
-        return tokens.join(" ");
+        const encodeByte = (b: number): string => {
+            if (b < 0x10) {
+                return hexChars[b] + " "; // 한 자리 + 공백
+            } else {
+                return hexChars[b >> 4] + hexChars[b & 0x0f]; // 두 자리
+            }
+        };
+
+        // 64바이트 × 2글자 = 128글자
+        return bytes.map(encodeByte).join("");
     }
 
     const clearAll = () => {
