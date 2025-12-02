@@ -470,7 +470,7 @@ export default function LEDDotEditor() {
                 <div
                     style={{
                         display: "flex",
-                        gap: 8,
+                        gap: 10,
                         alignItems: "center",
                         fontSize: 12,
                     }}
