@@ -13,7 +13,7 @@ export default function LEDDotEditor() {
     const [invertBits, setInvertBits] = useState(false);
     const [singleLine, setSingleLine] = useState(true); // 한 줄 출력 옵션 (기본 ON)
 
-    // .fnt 입력
+    // .fnt / 레거시 헥사 입력
     const [fntInput, setFntInput] = useState("");
 
     // 드래그 상태
@@ -154,7 +154,7 @@ export default function LEDDotEditor() {
         alert("LED_Display용 HEX 배열이 클립보드에 복사되었습니다!");
     };
 
-    // ---------- 여기서부터 .fnt 헬퍼 ----------
+    // ---------- 여기서부터 .fnt / 레거시 헥사 헬퍼 ----------
 
     // (중요) 한 행(32비트)을 .fnt 토큰으로
     //  - row[x]에서 x=0이 LSB(bit0)
@@ -180,167 +180,140 @@ export default function LEDDotEditor() {
         return tokens.join(" ");
     }
 
-    // 레거시 헥사 한 줄(공백 섞여도 됨) -> 8헥사 × 16개로 정규화
-    function normalizeLegacyHexLine(line: string): string {
-        // 숫자/헥사만 추출
-        const hex = line.toUpperCase().replace(/[^0-9A-F]/g, "");
-        // 32비트(8헥사) × 16줄 = 128헥사
-        if (hex.length !== 128) {
-            throw new Error(`헥사 길이가 ${hex.length}자리입니다. 32비트×16줄이면 128자리여야 합니다. (지금 건 자동 포맷 불가)`);
-        }
-
-        const tokens: string[] = [];
-        for (let i = 0; i < 16; i++) {
-            tokens.push(hex.slice(i * 8, i * 8 + 8));
-        }
-        // "00000000 FE7FE01F ..." 이렇게 반환
-        return tokens.join(" ");
-    }
-
-    const handleImportLegacyFnt = () => {
-        try {
-            // 1) 레거시 헥사 한 줄을 정규 .fnt 라인으로 변환
-            const normalized = normalizeLegacyHexLine(fntInput);
-
-            // 2) 정규 포맷으로 LED 도트 생성
-            const newDots = importFntToDots(normalized);
-
-            // 3) 그리드에 반영 + textarea도 정규 포맷으로 바꿔줌
-            setDots(newDots);
-            setFntInput(normalized);
-
-            alert("레거시 헥사를 8자리×16개 .fnt 포맷으로 변환해서 적용했습니다.");
-        } catch (e: any) {
-            console.error(e);
-            alert(e?.message ?? "레거시 헥사 포맷 중 오류가 발생했습니다.");
-        }
-    };
-    // .fnt 한 줄 → 토큰 16개
-    //  - 공백 단위로 자른 토큰 하나 = 32비트 값 하나(row 하나)
-    //  - "0" 이면 그 줄 전체 0
-    //  - 나머지는 길이에 상관없이 tokenToRow 안에서 8헥사로 패딩/슬라이스
-    function parseFntLine(line: string): string[] {
-        const rough = line
+    // 레거시 텍스트 헥사 한 줄 → 바이트 배열
+    //  - 토큰 단위로 자르고
+    //  - 각 토큰에서 헥사만 뽑아서 왼쪽부터 2글자씩 = 1바이트
+    //  - 마지막 1글자 남으면 0x0X 한 바이트로 처리
+    function legacyFntLineToBytes(line: string): number[] {
+        const tokens = line
             .trim()
             .split(/\s+/)
             .filter(t => t.length > 0);
 
-        const tokens: string[] = [];
+        const bytes: number[] = [];
 
-        for (const raw of rough) {
-            let s = raw.trim().toUpperCase();
-            if (!s) continue;
-
-            // 헥사만 남기기
-            s = s.replace(/[^0-9A-F]/g, "");
+        for (const raw of tokens) {
+            let s = raw.toUpperCase().replace(/[^0-9A-F]/g, "");
             if (!s) continue;
 
             if (s === "0") {
-                tokens.push("0");
-            } else {
-                tokens.push(s);
+                // 원래 파일에서도 "0" 하나가 00 한 바이트 의미
+                bytes.push(0x00);
+                continue;
             }
-            if (tokens.length === 16) break;
+
+            while (s.length > 0) {
+                if (s.length === 1) {
+                    // 마지막 한 글자 남았을 때 -> 0x0X 한 바이트
+                    bytes.push(parseInt(s, 16));
+                    s = "";
+                } else {
+                    bytes.push(parseInt(s.slice(0, 2), 16));
+                    s = s.slice(2);
+                }
+            }
         }
 
-        // 16줄이 안 되면 아래를 0으로 채워서 맞추기
-        while (tokens.length < 16) tokens.push("0");
-
-        // 16개 초과면 잘라냄
-        if (tokens.length > 16) tokens.splice(16);
-
-        return tokens;
+        return bytes;
     }
 
+    // 바이트 배열(최소 64바이트) → 16×32 dots
+    function bytesToDots32x16(bytes: number[]): number[][] {
+        const buf = bytes.slice(0, 64);
+        while (buf.length < 64) buf.push(0);
+
+        const dots: number[][] = [];
+
+        for (let y = 0; y < 16; y++) {
+            const base = y * 4;
+            const b0 = buf[base] ?? 0;
+            const b1 = buf[base + 1] ?? 0;
+            const b2 = buf[base + 2] ?? 0;
+            const b3 = buf[base + 3] ?? 0;
+
+            const v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+
+            const row: number[] = new Array(32).fill(0);
+            for (let x = 0; x < 32; x++) {
+                row[x] = (v >>> x) & 1;
+            }
+            dots.push(row);
+        }
+
+        return dots;
+    }
+
+    // 레거시 헥사 한 줄 → 바이트 스트림 → dots → 정규 .fnt 라인으로도 세팅
+    const handleImportLegacyFnt = () => {
+        try {
+            const bytes = legacyFntLineToBytes(fntInput);
+            const newDots = bytesToDots32x16(bytes);
+            setDots(newDots);
+
+            // textarea에는 정규화된 .fnt 라인을 보여주도록
+            const normalizedFnt = exportFntFromDots(newDots);
+            //setFntInput(normalizedFnt);
+
+            alert("레거시 헥사를 해석해서 LED 도트 + .fnt 포맷으로 변환했습니다.");
+        } catch (e: any) {
+            console.error(e);
+            alert(e?.message ?? "레거시 헥사 파싱 중 오류가 발생했습니다.");
+        }
+    };
+
     const downloadFntFile = () => {
-        const fntLine = exportFntFromDots(dots); // "00000000 FE7FE01F ..." 형식
-        const blob = new Blob([fntLine + "\n"], {
-            type: "text/plain;charset=utf-8",
+        // dots -> 레거시와 동일한 64바이트를 헥사 텍스트로 변환
+        const line = exportLegacyStyleFromDots(dots);
+
+        // 레거시 파일들은 CRLF(0x0D 0x0A)로 끝남
+        const fntContent = line + "\r\n";
+
+        const blob = new Blob([fntContent], {
+            type: "text/plain;charset=us-ascii",
         });
         const url = URL.createObjectURL(blob);
 
         const a = document.createElement("a");
         a.href = url;
-        a.download = "font.fnt"; // 원하는 파일명
+        a.download = "font.fnt";
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
 
         URL.revokeObjectURL(url);
     };
-    // 토큰 하나 → 한 행 32비트 (0/1 배열)
-    //  - s: 최대 8헥사
-    //  - s 길이가 모자라면 왼쪽을 0으로 채움
-    //  - FE7FE01F -> 바이트 [FE,7F,E0,1F]
-    //  - v = FE | (7F<<8) | (E0<<16) | (1F<<24)
-    //  - row[x] = (v >> x) & 1 (bit0 = 가장 왼쪽 칸)
-    function tokenToRow(token: string): number[] {
-        const row = Array(32).fill(0);
-        if (!token || token === "0") return row;
 
-        let s = token.toUpperCase().replace(/[^0-9A-F]/g, "");
-        if (!s) return row;
+    function exportLegacyStyleFromDots(dots: number[][]): string {
+        // 1) dots -> 레거시가 쓰는 64바이트(16행 × 4바이트, little-endian)
+        const bytes: number[] = [];
 
-        if (s.length < 8) {
-            s = s.padStart(8, "0");
-        } else if (s.length > 8) {
-            s = s.slice(0, 8);
-        }
-
-        const b0 = parseInt(s.slice(0, 2), 16);
-        const b1 = parseInt(s.slice(2, 4), 16);
-        const b2 = parseInt(s.slice(4, 6), 16);
-        const b3 = parseInt(s.slice(6, 8), 16);
-
-        const v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-
-        for (let x = 0; x < 32; x++) {
-            row[x] = (v >> x) & 1; // bit0 -> 맨 왼쪽
-        }
-        return row;
-    }
-
-    // 디버그용: 현재 dots를 다시 32비트 헥사로 찍어보기
-    function debugPrintDotsAsHexRows(dotsSrc: number[][]) {
-        console.log("=== dots -> 32비트 HEX ===");
         for (let y = 0; y < 16; y++) {
-            const row = dotsSrc[y];
             let v = 0;
             for (let x = 0; x < 32; x++) {
-                if (row[x]) v |= 1 << x; // bit0 -> 왼쪽
+                if (dots[y][x]) {
+                    v |= 1 << x; // bytesToDots32x16 의 역연산
+                }
             }
-            const bytes = [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff];
-            const hex = bytes.map(b => b.toString(16).toUpperCase().padStart(2, "0")).join("");
-            console.log(`row ${y}: ${hex}`);
+            // little-endian으로 4바이트 쪼개기 (레거시 .fnt 와 동일)
+            bytes.push(v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff);
         }
+
+        // 2) 64바이트 -> 레거시 스타일 토큰
+        //    규칙:
+        //      - 0x00 -> "0"
+        //      - 그 외는 앞 0 없이 대문자 헥사 ("1", "8", "80", "C0" 등)
+        const tokens: string[] = [];
+        for (const b of bytes) {
+            if (b === 0) {
+                tokens.push("0");
+            } else {
+                tokens.push(b.toString(16).toUpperCase()); // "1" ~ "FF"
+            }
+        }
+
+        // 3) 공백으로 구분된 한 줄
+        return tokens.join(" ");
     }
-
-    // .fnt 한 줄 전체 → 16×32 dots
-    function importFntToDots(line: string): number[][] {
-        const tokens = parseFntLine(line);
-        const newDots: number[][] = [];
-        for (let y = 0; y < 16; y++) {
-            newDots.push(tokenToRow(tokens[y]));
-        }
-        return newDots;
-    }
-
-    const exportFnt = () => {
-        const fntLine = exportFntFromDots(dots);
-        navigator.clipboard.writeText(fntLine);
-        alert(".fnt 포맷 문자열이 클립보드에 복사되었습니다!");
-    };
-
-    const handleImportFnt = () => {
-        try {
-            const newDots = importFntToDots(fntInput);
-            setDots(newDots);
-            alert(".fnt 데이터를 LED 도트에 반영했습니다.");
-        } catch (e) {
-            console.error(e);
-            alert(".fnt 파싱 중 오류가 발생했습니다. 형식을 확인해 주세요.");
-        }
-    };
 
     const clearAll = () => {
         setDots(Array.from({ length: rows }, () => Array(cols).fill(0)));
@@ -462,28 +435,19 @@ export default function LEDDotEditor() {
                 <button onClick={exportHexForLED} style={btnStyle("#10B981")}>
                     복사하기 (HEX 128바이트)
                 </button>
-
-                <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={handleImportFnt} style={btnStyle("#3B82F6")}>
-                        .fnt → LED 적용
-                    </button>
-                    <button onClick={handleImportLegacyFnt} style={btnStyle("#6366F1")}>
-                        레거시 헥사 → 포맷+적용
-                    </button>
-                </div>
-                <button onClick={downloadFntFile} style={btnStyle("#4B5563")}>
+                <button onClick={exportBinaryMatrix} style={btnStyle("#4a5d83")}>
+                    복사하기 (바이너리)
+                </button>
+                <button onClick={downloadFntFile} style={btnStyle("#1f519c")}>
                     .fnt 파일로 저장
                 </button>
 
                 <button onClick={clearAll} style={btnStyle("#6b7280")}>
                     전체 지우기
                 </button>
-                <button onClick={exportBinaryMatrix} style={btnStyle("#6b7280")}>
-                    현재 도트 바이너리로
-                </button>
             </div>
 
-            {/* .fnt 입력 → LED 반영 */}
+            {/* .fnt / 레거시 헥사 입력 */}
             <div
                 style={{
                     display: "flex",
@@ -494,11 +458,6 @@ export default function LEDDotEditor() {
                     maxWidth: "100%",
                 }}
             >
-                <span style={{ fontSize: 12, opacity: 0.8 }}>
-                    .fnt 불러오기 (행마다 32비트 값 하나씩, 공백 구분)
-                    <br />
-                    예) <code style={{ fontFamily: "monospace" }}>0 1FE07FFE 3FF07FFE 60180180 ...</code>
-                </span>
                 <textarea
                     value={fntInput}
                     onChange={e => setFntInput(e.target.value)}
@@ -514,11 +473,11 @@ export default function LEDDotEditor() {
                         fontFamily: "monospace",
                         fontSize: 12,
                     }}
-                    placeholder="0 1FE07FFE 3FF07FFE 60180180 ..."
+                    placeholder="0 0 0 0 FE7FE01FFE7FF03F801 1860801 ..."
                 />
                 <div style={{ display: "flex", gap: 8 }}>
-                    <button onClick={handleImportFnt} style={btnStyle("#3B82F6")}>
-                        .fnt → LED 적용
+                    <button onClick={handleImportLegacyFnt} style={btnStyle("#6366F1")}>
+                        헥사값 DISPLAY
                     </button>
                 </div>
             </div>
